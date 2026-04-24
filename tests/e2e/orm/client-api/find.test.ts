@@ -366,6 +366,171 @@ describe('Client find tests ', () => {
         );
     });
 
+    it('uses standard joins for to-one and non-topN to-many includes', async () => {
+        if (process.env['TEST_DB_PROVIDER'] !== 'postgresql') {
+            return;
+        }
+
+        await client.$disconnect();
+        const queries: string[] = [];
+        const sqlClient = await createTestClient(schema, {
+            log: (event) => {
+                if (event.level === 'query' && event.query.sql) {
+                    queries.push(event.query.sql.toLowerCase());
+                }
+            },
+        });
+
+        const user = await createUser(sqlClient, 'joins@test.com', { id: 'u-joins' });
+        const post = await sqlClient.post.create({
+            data: { id: 'p-joins', title: 'Post joins', authorId: user.id },
+        });
+        await sqlClient.comment.create({
+            data: { id: 'c-joins-1', content: 'Comment joins 1', postId: post.id },
+        });
+        await sqlClient.comment.create({
+            data: { id: 'c-joins-2', content: 'Comment joins 2', postId: post.id },
+        });
+
+        queries.length = 0;
+        await sqlClient.post.findMany({
+            where: { id: post.id },
+            include: { author: true },
+        });
+        const toOneSql = queries.join('\n');
+        expect(toOneSql).toContain(' left join ');
+        expect(toOneSql).not.toContain('left join lateral');
+
+        queries.length = 0;
+        await sqlClient.post.findMany({
+            where: { id: post.id },
+            include: { comments: true },
+        });
+        const toManyNoTopNSql = queries.join('\n');
+        expect(toManyNoTopNSql).toContain(' left join ');
+        expect(toManyNoTopNSql).not.toContain('left join lateral');
+
+        queries.length = 0;
+        await sqlClient.post.findMany({
+            where: { id: post.id },
+            include: {
+                comments: {
+                    orderBy: { id: 'asc' },
+                    take: 1,
+                    include: {
+                        post: { select: { title: true } },
+                    },
+                },
+            },
+        });
+        const topNSql = queries.join('\n');
+        expect(topNSql).not.toContain('$post$sub');
+        expect(topNSql).toContain('from (select');
+        expect(topNSql).toContain('order by');
+        expect(topNSql).toContain('limit');
+        if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'true') {
+            expect(topNSql).toContain(' with ');
+        } else {
+            expect(topNSql).toContain('left join lateral');
+        }
+
+        await sqlClient.$disconnect();
+    });
+
+    it('uses root WITH clause for nested include in cte dialect', async () => {
+        if (
+            process.env['TEST_DB_PROVIDER'] !== 'postgresql' ||
+            process.env['TEST_PG_NESTED_RELATION_DIALECT'] !== 'cte' ||
+            process.env['TEST_SET_BASED_NESTED_INCLUDE'] !== 'true'
+        ) {
+            return;
+        }
+
+        const queries: string[] = [];
+        await client.$disconnect();
+        const cteClient = await createTestClient(schema, {
+            log: (event) => {
+                if (event.level === 'query' && event.query.sql) {
+                    queries.push(event.query.sql.toLowerCase());
+                }
+            },
+        });
+
+        await createUser(cteClient, 'cte@test.com', {
+            posts: {
+                create: [
+                    { id: 'c1', title: 'Post1' },
+                    { id: 'c2', title: 'Post2' },
+                ],
+            },
+        });
+
+        await cteClient.user.findFirst({
+            include: {
+                posts: { orderBy: { title: 'desc' }, skip: 0, take: 1 },
+            },
+        });
+
+        await cteClient.$disconnect();
+
+        expect(queries.some((q) => q.startsWith('with '))).toBe(true);
+    });
+
+    it('supports tier6 wide posts benchmark shape in cte dialect', async () => {
+        if (
+            process.env['TEST_DB_PROVIDER'] !== 'postgresql' ||
+            process.env['TEST_PG_NESTED_RELATION_DIALECT'] !== 'cte' ||
+            process.env['TEST_SET_BASED_NESTED_INCLUDE'] !== 'true'
+        ) {
+            return;
+        }
+
+        const u1 = await createUser(client, 'u1@example.com', { id: 'u1' });
+
+        for (let i = 1; i <= 100; i++) {
+            await client.post.create({
+                data: {
+                    id: `p${i}`,
+                    title: `T-u1-${String(i).padStart(3, '0')}`,
+                    published: i % 2 === 0,
+                    authorId: u1.id,
+                    comments: {
+                        create: {
+                            id: `c${i}`,
+                            content: `C${i}`,
+                        },
+                    },
+                },
+            });
+        }
+
+        const result = await client.post.findMany({
+            where: { authorId: 'u1' },
+            take: 80,
+            orderBy: [{ id: 'desc' }],
+            include: {
+                author: { select: { id: true, email: true } },
+                comments: {
+                    orderBy: [{ id: 'asc' }],
+                    take: 20,
+                    include: {
+                        post: { select: { id: true, title: true, published: true } },
+                    },
+                },
+            },
+        });
+
+        expect(result).toHaveLength(80);
+        expect(result[0]).toMatchObject({
+            id: 'p99',
+            author: { id: 'u1', email: 'u1@example.com' },
+        });
+        expect(result.every((post) => post.comments.length <= 20)).toBe(true);
+        expect(result[0]?.comments[0]).toMatchObject({
+            post: { id: expect.any(String), title: expect.any(String), published: expect.any(Boolean) },
+        });
+    });
+
     it('works with unique finds', async () => {
         let r = await client.user.findUnique({ where: { id: 'none' } });
         expect(r).toBeNull();

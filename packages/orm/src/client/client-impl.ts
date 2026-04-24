@@ -33,9 +33,9 @@ import { FindOperationHandler } from './crud/operations/find';
 import { GroupByOperationHandler } from './crud/operations/group-by';
 import { UpdateOperationHandler } from './crud/operations/update';
 import { InputValidator } from './crud/validator';
-import type { Diagnostics, QueryInfo } from './diagnostics';
+import type { Diagnostics, QueryInfo, QueryTimingInfo, TimingCategory, TimingStat } from './diagnostics';
 import { createConfigError, createNotFoundError, createNotSupportedError } from './errors';
-import { ZenStackDriver } from './executor/zenstack-driver';
+import { performanceNow, ZenStackDriver } from './executor/zenstack-driver';
 import { ZenStackQueryExecutor } from './executor/zenstack-query-executor';
 import * as BuiltinFunctions from './functions';
 import { SchemaDbPusher } from './helpers/schema-db-pusher';
@@ -49,6 +49,26 @@ type ExtResultFieldDef = {
     needs: Record<string, true>;
     compute: (data: Record<string, any>) => unknown;
 };
+
+function makeInitialTimingStats(): Record<TimingCategory, TimingStat> {
+    return {
+        validationMs: { count: 0, totalMs: 0, maxMs: 0 },
+        queryTransformMs: { count: 0, totalMs: 0, maxMs: 0 },
+        nameMappingMs: { count: 0, totalMs: 0, maxMs: 0 },
+        tempAliasMs: { count: 0, totalMs: 0, maxMs: 0 },
+        compileMs: { count: 0, totalMs: 0, maxMs: 0 },
+        compileCacheKeyMs: { count: 0, totalMs: 0, maxMs: 0 },
+        compileCacheLookupMs: { count: 0, totalMs: 0, maxMs: 0 },
+        compileCacheStoreMs: { count: 0, totalMs: 0, maxMs: 0 },
+        dbExecuteMs: { count: 0, totalMs: 0, maxMs: 0 },
+        resultProcessMs: { count: 0, totalMs: 0, maxMs: 0 },
+        pluginOnQueryMs: { count: 0, totalMs: 0, maxMs: 0 },
+        pluginOnKyselyMs: { count: 0, totalMs: 0, maxMs: 0 },
+        mutationHookMs: { count: 0, totalMs: 0, maxMs: 0 },
+        transactionOverheadMs: { count: 0, totalMs: 0, maxMs: 0 },
+        executorUntrackedMs: { count: 0, totalMs: 0, maxMs: 0 },
+    };
+}
 
 /**
  * ZenStack ORM client.
@@ -70,6 +90,8 @@ export class ClientImpl {
     private auth: AuthType<SchemaDef> | undefined;
     inputValidator: InputValidator<SchemaDef>;
     readonly slowQueries: QueryInfo[] = [];
+    readonly queryTimings: QueryTimingInfo[] = [];
+    readonly timingStats: Record<TimingCategory, TimingStat> = makeInitialTimingStats();
 
     constructor(
         private readonly schema: SchemaDef,
@@ -104,6 +126,8 @@ export class ClientImpl {
             this.kyselyRaw = baseClient.kyselyRaw;
             this.auth = baseClient.auth;
             this.slowQueries = baseClient.slowQueries;
+            this.queryTimings = baseClient.queryTimings;
+            this.timingStats = baseClient.timingStats;
         } else {
             const driver = new ZenStackDriver(options.dialect.createDriver(), new Log(this.$options.log ?? []));
             const compiler = options.dialect.createQueryCompiler();
@@ -152,11 +176,27 @@ export class ClientImpl {
             const diagnosticsSchema = z.object({
                 slowQueryThresholdMs: z.number().nonnegative().optional(),
                 slowQueryMaxRecords: z.int().nonnegative().or(z.literal(Infinity)).optional(),
+                timingMaxRecords: z.int().nonnegative().or(z.literal(Infinity)).optional(),
+                compiledQueryCacheMaxEntries: z.int().nonnegative().or(z.literal(Infinity)).optional(),
+                transformedQueryCacheMaxEntries: z.int().nonnegative().or(z.literal(Infinity)).optional(),
             });
             const parseResult = diagnosticsSchema.safeParse(options.diagnostics);
             if (!parseResult.success) {
                 throw createConfigError(`Invalid diagnostics configuration: ${formatError(parseResult.error)}`);
             }
+        }
+
+        if (options.setBasedNestedInclude !== undefined && typeof options.setBasedNestedInclude !== 'boolean') {
+            throw createConfigError('Invalid setBasedNestedInclude configuration: expected a boolean');
+        }
+
+        if (
+            options.postgresNestedRelationDialect !== undefined &&
+            !['lateral', 'cte'].includes(options.postgresNestedRelationDialect)
+        ) {
+            throw createConfigError(
+                'Invalid postgresNestedRelationDialect configuration: expected "lateral" or "cte"',
+            );
         }
     }
 
@@ -459,7 +499,40 @@ export class ClientImpl {
         return Promise.resolve({
             zodCache: this.inputValidator.zodFactory.cacheStats,
             slowQueries: this.slowQueries.map((q) => ({ ...q })).sort((a, b) => b.durationMs - a.durationMs),
+            timing: {
+                categories: Object.fromEntries(
+                    Object.entries(this.timingStats).map(([key, value]) => [key, { ...value }]),
+                ) as Diagnostics['timing']['categories'],
+                recentQueries: this.queryTimings.map((q) => ({ ...q })).sort((a, b) => b.totalMs - a.totalMs),
+            },
         });
+    }
+
+    recordTiming(category: TimingCategory, durationMs: number) {
+        if (!this.$options.diagnostics || !Number.isFinite(durationMs) || durationMs < 0) {
+            return;
+        }
+        const stat = this.timingStats[category];
+        stat.count += 1;
+        stat.totalMs += durationMs;
+        if (durationMs > stat.maxMs) {
+            stat.maxMs = durationMs;
+        }
+    }
+
+    recordQueryTiming(queryTiming: QueryTimingInfo) {
+        if (!this.$options.diagnostics) {
+            return;
+        }
+        const maxRecords = this.$options.diagnostics.timingMaxRecords ?? 100;
+        if (maxRecords <= 0) {
+            return;
+        }
+        const queryTimings = this.queryTimings;
+        if (queryTimings.length >= maxRecords) {
+            queryTimings.shift();
+        }
+        queryTimings.push(queryTiming);
     }
 
     $executeRaw(query: TemplateStringsArray, ...values: any[]) {
@@ -626,14 +699,18 @@ function createModelCrudHandler(
                 }
                 let result: unknown;
                 if (r && postProcess) {
+                    const resultProcessStart = performanceNow();
                     result = resultProcessor.processResult(r, model, processedArgs);
+                    (client as any).recordTiming?.('resultProcessMs', performanceNow() - resultProcessStart);
                 } else {
                     result = r ?? null;
                 }
 
                 // compute ext result fields (recursively handles nested relations)
                 if (result && shouldApplyExtResult) {
+                    const resultProcessStart = performanceNow();
                     result = applyExtResult(result, model, _args, schema, plugins);
+                    (client as any).recordTiming?.('resultProcessMs', performanceNow() - resultProcessStart);
                 }
 
                 return result;
@@ -645,17 +722,33 @@ function createModelCrudHandler(
                 const onQuery = plugin.onQuery;
                 if (onQuery) {
                     const _proceed = proceed;
-                    proceed = (_args: unknown) => {
-                        const ctx: any = {
-                            client,
-                            model,
-                            operation: nominalOperation,
-                            // reflect the latest override if provided
-                            args: _args,
-                            // ensure inner overrides are propagated to the previous proceed
-                            proceed: (nextArgs: unknown) => _proceed(nextArgs),
-                        };
-                        return (onQuery as (ctx: any) => Promise<unknown>)(ctx);
+                    proceed = async (_args: unknown) => {
+                        let proceedDuration = 0;
+                        const onQueryStart = performanceNow();
+                        try {
+                            const ctx: any = {
+                                client,
+                                model,
+                                operation: nominalOperation,
+                                // reflect the latest override if provided
+                                args: _args,
+                                // ensure inner overrides are propagated to the previous proceed
+                                proceed: async (nextArgs: unknown) => {
+                                    const proceedStart = performanceNow();
+                                    try {
+                                        return await _proceed(nextArgs);
+                                    } finally {
+                                        proceedDuration += performanceNow() - proceedStart;
+                                    }
+                                },
+                            };
+                            return await (onQuery as (ctx: any) => Promise<unknown>)(ctx);
+                        } finally {
+                            (client as any).recordTiming?.(
+                                'pluginOnQueryMs',
+                                Math.max(0, performanceNow() - onQueryStart - proceedDuration),
+                            );
+                        }
                     };
                 }
             }
