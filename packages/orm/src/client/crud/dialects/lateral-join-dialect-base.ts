@@ -266,6 +266,12 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
             );
         }
 
+        // Include this relation's row alias in scope while building JSON so nested to-one
+        // inlines (e.g. Comment.post → Post) resolve against the correct FROM entry.
+        const scopeWithRelationRow = {
+            ...scopeAliases,
+            [relationModel]: relationSelectName,
+        };
         tbl = this.buildRelationObjectSelect(
             relationModel,
             relationSelectName,
@@ -273,12 +279,9 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
             tbl,
             payload,
             resultName,
-            scopeAliases,
+            scopeWithRelationRow,
         );
-        tbl = this.buildRelationJoins(tbl, relationModel, relationSelectName, payload, resultName, {
-            ...scopeAliases,
-            [relationModel]: relationSelectName,
-        });
+        tbl = this.buildRelationJoins(tbl, relationModel, relationSelectName, payload, resultName, scopeWithRelationRow);
 
         const joinPairs = buildJoinPairs(this.schema, model, parentAlias, relationField, relationSelectName);
         const relationJoinKeyAliases: string[] = [];
@@ -863,6 +866,12 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
 
     private tryBuildInlineAncestorRelationJson(fieldDef: FieldDef, payload: any, scopeAliases: Record<string, string>) {
         if (!fieldDef.relation || fieldDef.array) {
+            return undefined;
+        }
+        // Only delegate / mixin "ancestor" fields: normal to-one relations must use the lateral join
+        // JSON (`$data` ref). Without this guard, e.g. `Comment.post` could wrongly resolve `Post` to an
+        // unrelated outer `Post` alias in `scopeAliases` and emit invalid SQL.
+        if (!fieldDef.originModel) {
             return undefined;
         }
         // Delegate / mixin models: the FK row may be selected under `originModel` (base) while
