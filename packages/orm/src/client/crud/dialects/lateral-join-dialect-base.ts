@@ -202,9 +202,12 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                         );
 
                         if (typeof payload !== 'object' || payload.take === undefined) {
-                            // force adding a limit otherwise the ordering is ignored by some databases
-                            // during JSON array aggregation
-                            subQuery = subQuery.limit(Number.MAX_SAFE_INTEGER);
+                            // MySQL / SQLite: ORDER BY in subqueries used for JSON aggregation can be ignored
+                            // without a LIMIT; PostgreSQL honors ORDER BY in lateral subqueries and a
+                            // MAX_SAFE_INTEGER LIMIT forces a full scan + sort, so skip it on PG.
+                            if (this.provider === 'mysql' || this.provider === 'sqlite') {
+                                subQuery = subQuery.limit(Number.MAX_SAFE_INTEGER);
+                            }
                         }
 
                         return subQuery.as(relationSelectName);
