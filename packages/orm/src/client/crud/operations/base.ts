@@ -303,7 +303,7 @@ export abstract class BaseOperationHandler<Schema extends SchemaDef> {
             if (shouldPrePaginateBeforeIncludes) {
                 // Force pagination to happen before nested relation joins so lateral/include work
                 // is only evaluated for the limited parent row set.
-                const paginatedBase = this.dialect.buildFilterSortTake(model, readArgs as any, query, model);
+                const paginatedBase = this.dialect.buildFilterSortTake(model, readArgs as any, query, model).selectAll(model);
                 query = kysely.selectFrom(() => paginatedBase.as(model)).selectAll();
                 outerArgs = {
                     ...readArgs,
