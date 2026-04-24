@@ -865,7 +865,10 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         if (!fieldDef.relation || fieldDef.array) {
             return undefined;
         }
-        const ancestorAlias = scopeAliases[fieldDef.type];
+        // Delegate / mixin models: the FK row may be selected under `originModel` (base) while
+        // `fieldDef.type` names the logical model. Prefer the alias key that actually exists in scope.
+        const scopeModelKey = fieldDef.originModel ?? fieldDef.type;
+        const ancestorAlias = scopeAliases[scopeModelKey] ?? scopeAliases[fieldDef.type];
         if (!ancestorAlias) {
             return undefined;
         }
@@ -876,6 +879,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         const relationModelDef = requireModel(this.schema, fieldDef.type) as any;
         const objArgs: Record<string, Expression<unknown>> = {};
 
+        const fieldModel = fieldDef.originModel ?? fieldDef.type;
         if (payload === true || !payload?.select) {
             const omit = typeof payload === 'object' ? payload.omit : undefined;
             Object.assign(
@@ -884,7 +888,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                     .filter(([, value]) => !value.relation)
                     .filter(([name]) => !this.shouldOmitField(omit, fieldDef.type, name))
                     .map(([field]) => ({
-                        [field]: this.fieldRef(fieldDef.type, field, ancestorAlias, false),
+                        [field]: this.fieldRef(fieldModel, field, ancestorAlias, false),
                     })),
             );
         } else {
@@ -894,7 +898,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                     .filter(([, value]) => value)
                     .filter(([name]) => !requireField(this.schema, fieldDef.type, name).relation)
                     .map(([field]) => ({
-                        [field]: this.fieldRef(fieldDef.type, field, ancestorAlias, false),
+                        [field]: this.fieldRef(fieldModel, field, ancestorAlias, false),
                     })),
             );
         }
