@@ -190,6 +190,9 @@ export async function createTestClient(
     if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'true') {
         _options.setBasedNestedInclude = true;
     }
+    if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'false') {
+        _options.setBasedNestedInclude = false;
+    }
 
     if (process.env['TEST_PG_NESTED_RELATION_DIALECT']) {
         (_options as any).postgresNestedRelationDialect = process.env['TEST_PG_NESTED_RELATION_DIALECT'] as

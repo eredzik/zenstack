@@ -428,21 +428,17 @@ describe('Client find tests ', () => {
         expect(topNSql).toContain('from (select');
         expect(topNSql).toContain('order by');
         expect(topNSql).toContain('limit');
-        if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'true') {
-            expect(topNSql).toContain(' with ');
-        } else {
+        if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'false') {
             expect(topNSql).toContain('left join lateral');
+        } else {
+            expect(topNSql).toContain(' with ');
         }
 
         await sqlClient.$disconnect();
     });
 
     it('uses root WITH clause for nested include in cte dialect', async () => {
-        if (
-            process.env['TEST_DB_PROVIDER'] !== 'postgresql' ||
-            process.env['TEST_PG_NESTED_RELATION_DIALECT'] !== 'cte' ||
-            process.env['TEST_SET_BASED_NESTED_INCLUDE'] !== 'true'
-        ) {
+        if (process.env['TEST_DB_PROVIDER'] !== 'postgresql' || process.env['TEST_PG_NESTED_RELATION_DIALECT'] === 'lateral') {
             return;
         }
 
@@ -477,11 +473,7 @@ describe('Client find tests ', () => {
     });
 
     it('supports tier6 wide posts benchmark shape in cte dialect', async () => {
-        if (
-            process.env['TEST_DB_PROVIDER'] !== 'postgresql' ||
-            process.env['TEST_PG_NESTED_RELATION_DIALECT'] !== 'cte' ||
-            process.env['TEST_SET_BASED_NESTED_INCLUDE'] !== 'true'
-        ) {
+        if (process.env['TEST_DB_PROVIDER'] !== 'postgresql' || process.env['TEST_PG_NESTED_RELATION_DIALECT'] === 'lateral') {
             return;
         }
 

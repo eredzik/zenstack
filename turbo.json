@@ -22,6 +22,7 @@
     "globalPassThroughEnv": [
         "TEST_DB_PROVIDER",
         "TEST_SET_BASED_NESTED_INCLUDE",
+        "TEST_PG_NESTED_RELATION_DIALECT",
         "TEST_PG_HOST",
         "TEST_PG_PORT",
         "TEST_PG_USER",

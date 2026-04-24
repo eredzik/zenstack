@@ -218,7 +218,10 @@ export type ClientOptions<Schema extends SchemaDef> = QueryOptions<Schema> & {
 
     /**
      * Enables set-based SQL generation for nested includes with ordering/pagination when supported by the
-     * selected dialect and query shape. Defaults to `false`.
+     * selected dialect and query shape.
+     *
+     * For **PostgreSQL**, this defaults to `true` when omitted (set-based window plans where applicable).
+     * For other providers, it defaults to `false`. Set explicitly to override.
      *
      * When enabled, ORM may choose a CTE/window-function based plan instead of correlated lateral subqueries
      * for certain findMany + nested include queries to reduce repeated per-parent work.
@@ -228,8 +231,8 @@ export type ClientOptions<Schema extends SchemaDef> = QueryOptions<Schema> & {
     /**
      * Strategy for PostgreSQL nested-relation SQL generation.
      *
-     * - `lateral` (default): correlated lateral joins / derived tables.
-     * - `cte`: CTE-based relation planning dialect.
+     * - `lateral`: correlated lateral joins / derived tables.
+     * - `cte` (default when omitted on PostgreSQL): CTE-based relation planning dialect.
      *
      * This option is only honored when datasource provider is PostgreSQL.
      */
