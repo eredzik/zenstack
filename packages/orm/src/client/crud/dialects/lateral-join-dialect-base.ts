@@ -85,6 +85,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
             payload,
             relationResultName,
             { [model]: parentAlias },
+            { applySetBasedToManyParentJoinFilter: true },
         );
         return joinedQuery.select(`${relationResultName}.$data as ${relationField}`);
     }
@@ -137,7 +138,9 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         payload: true | FindArgs<Schema, GetModels<Schema>, any, true>,
         resultName: string,
         scopeAliases: Record<string, string>,
+        options?: { applySetBasedToManyParentJoinFilter?: boolean },
     ) {
+        const applySetBasedToManyParentJoinFilter = options?.applySetBasedToManyParentJoinFilter !== false;
         const relationFieldDef = requireField(this.schema, model, relationField);
         const relationModel = relationFieldDef.type as GetModels<Schema>;
         const strategy = this.classifyRelationJoinStrategy(model, relationField, payload);
@@ -159,6 +162,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                 payload,
                 resultName,
                 scopeAliases,
+                applySetBasedToManyParentJoinFilter,
             );
         }
 
@@ -249,6 +253,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         payload: true | FindArgs<Schema, GetModels<Schema>, any, true>,
         resultName: string,
         scopeAliases: Record<string, string>,
+        applyParentJoinFilter: boolean,
     ) {
         const relationFieldDef = requireField(this.schema, model, relationField);
         invariant(relationFieldDef.array, 'buildSetBasedToManyRelationWithoutPaginationJSON expects a to-many relation');
@@ -256,13 +261,47 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         const relationSelectName = tmpAlias(`${resultName}$sub`);
         const relationModelDef = requireModel(this.schema, relationModel);
 
+        // Push FK = parent into the ordered relation subquery on PostgreSQL lateral dialect only
+        // when that subquery exists (`orderBy` / pagination on the include). Otherwise keep the
+        // set-based `LEFT JOIN` + hash aggregate plan (e.g. `include: { comments: true }`).
+        // Correlating on the outer row is not legal inside a plain derived `FROM (sub)` without
+        // LATERAL; CTE bodies cannot reference the outer FROM either.
+        const needsOrderedRelationSubquery = !this.canJoinWithoutNestedSelect(relationModelDef, payload);
+        const useCorrelatedParentFilter =
+            applyParentJoinFilter &&
+            this.provider === 'postgresql' &&
+            !this.useCteNestedRelations &&
+            needsOrderedRelationSubquery;
+
         let tbl: SelectQueryBuilder<any, any, any>;
         if (this.canJoinWithoutNestedSelect(relationModelDef, payload)) {
             tbl = this.buildModelSelect(relationModel, relationSelectName, payload, false);
+            if (useCorrelatedParentFilter) {
+                tbl = this.buildRelationJoinFilter(
+                    tbl,
+                    model,
+                    relationField,
+                    relationModel,
+                    relationSelectName,
+                    parentAlias,
+                );
+            }
         } else {
-            tbl = this.eb.selectFrom(() =>
-                this.buildModelSelect(relationModel, `${relationSelectName}$t`, payload, true).as(relationSelectName),
-            );
+            let inner = this.buildModelSelect(relationModel, `${relationSelectName}$t`, payload, true);
+            if (useCorrelatedParentFilter) {
+                // Keep the parent FK filter inside the ordered subquery. Using `selectFrom(() => …)`
+                // can hoist correlated predicates to an outer derived table; `selectFrom(q.as(alias))`
+                // preserves them on the inner scan.
+                inner = this.buildRelationJoinFilter(
+                    inner,
+                    model,
+                    relationField,
+                    relationModel,
+                    `${relationSelectName}$t`,
+                    parentAlias,
+                );
+            }
+            tbl = this.eb.selectFrom(inner.as(relationSelectName));
         }
 
         // Include this relation's row alias in scope while building JSON so nested to-one
@@ -302,6 +341,10 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                     return result;
                 },
             );
+        }
+
+        if (useCorrelatedParentFilter) {
+            return qb.leftJoinLateral(() => tbl.as(resultName), (join) => join.onTrue());
         }
 
         return qb.leftJoin(
@@ -833,6 +876,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                                 ...scopeAliases,
                                 [relationModel]: relationModelAlias,
                             },
+                            { applySetBasedToManyParentJoinFilter: false },
                         );
                     });
             }
