@@ -431,7 +431,10 @@ describe('Client find tests ', () => {
         if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'true') {
             expect(topNSql).toContain(' with ');
         } else {
-            expect(topNSql).toContain('left join lateral');
+            // PostgreSQL ordered take on to-many uses row_number() windowing even in lateral dialect
+            // (avoids N correlated scans when setBasedNestedInclude is unset).
+            expect(topNSql).toMatch(/row_number\(\)/);
+            expect(topNSql).not.toContain('left join lateral');
         }
 
         await sqlClient.$disconnect();

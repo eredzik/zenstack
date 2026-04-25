@@ -97,17 +97,16 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         const relationFieldDef = requireField(this.schema, model, relationField);
         const m2m = !!getManyToManyRelation(this.schema, model, relationField);
         const wantsTopNToMany = this.isTopNToManyRequest(relationFieldDef, payload);
-        const wantsSetBasedWindowRewrite = this.shouldUseSetBasedNestedInclude(model, relationField, payload);
 
         if (!relationFieldDef.array) {
             return 'toOneStandardJoin' as const;
         }
 
-        if (
-            wantsSetBasedWindowRewrite &&
-            this.canUseSetBasedToManyWindowing(model, relationField, payload) &&
-            !m2m
-        ) {
+        // PostgreSQL: always prefer the set-based window rewrite for ordered take/skip on
+        // to-many relations when supported. Gating this behind `setBasedNestedInclude`
+        // forced the legacy per-row lateral path (N correlated scans on the child table)
+        // whenever that option was disabled — e.g. lateral-mode benchmarks.
+        if (this.canUseSetBasedToManyWindowing(model, relationField, payload) && !m2m) {
             return 'toManySetBasedWindow' as const;
         }
 
@@ -184,10 +183,7 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                         parentAlias,
                     );
                 } else {
-                    // join with a nested query
-                    // NOTE: a dedicated set-based CTE/window rewrite is intentionally guarded behind
-                    // "setBasedNestedInclude" and query-shape detection. Until the rewrite path is
-                    // plugged in here, we preserve the existing lateral strategy as fallback.
+                    // join with a nested query (fallback when the PG window rewrite does not apply)
                     tbl = eb.selectFrom(() => {
                         let subQuery = this.buildModelSelect(relationModel, `${relationSelectName}$t`, payload, true);
 
@@ -552,29 +548,6 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                 return result;
             },
         );
-    }
-
-    /**
-     * Detects query shapes that are eligible for set-based nested include rewrite.
-     * The current implementation only gates the feature and keeps the existing SQL generation as fallback.
-     */
-    private shouldUseSetBasedNestedInclude(
-        model: string,
-        relationField: string,
-        payload: true | FindArgs<Schema, GetModels<Schema>, any, true>,
-    ) {
-        if (!this.options.setBasedNestedInclude) {
-            return false;
-        }
-
-        const fieldDef = requireField(this.schema, model, relationField);
-        if (!fieldDef.relation || !fieldDef.array || payload === true) {
-            return false;
-        }
-
-        const hasPagination = payload.take !== undefined || payload.skip !== undefined;
-        const hasOrdering = payload.orderBy !== undefined;
-        return hasPagination && hasOrdering;
     }
 
     private canUseSetBasedToManyWindowing(

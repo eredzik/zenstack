@@ -217,11 +217,10 @@ export type ClientOptions<Schema extends SchemaDef> = QueryOptions<Schema> & {
     skipValidationForComputedFields?: boolean;
 
     /**
-     * Enables set-based SQL generation for nested includes with ordering/pagination when supported by the
-     * selected dialect and query shape. Defaults to `false`.
+     * Reserved for future set-based nested-include rewrites beyond what the dialect applies by default.
      *
-     * When enabled, ORM may choose a CTE/window-function based plan instead of correlated lateral subqueries
-     * for certain findMany + nested include queries to reduce repeated per-parent work.
+     * On PostgreSQL, ordered `take`/`skip` on scalar to-many includes already use a window-function plan
+     * when the query shape is supported, regardless of this flag.
      */
     setBasedNestedInclude?: boolean;
 
