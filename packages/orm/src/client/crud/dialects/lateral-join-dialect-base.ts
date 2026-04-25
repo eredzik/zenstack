@@ -27,8 +27,9 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
     /**
      * When false, skip PostgreSQL correlated `LEFT JOIN LATERAL` for ordered set-based to-many
      * includes at the root — those re-run the lateral subquery per parent row and devastate
-     * large `findMany` (use one global hash-aggregate join instead). True after `take`/`skip`
-     * on the read (including implicit `take: 1` from findUnique).
+     * large `findMany` (use one global hash-aggregate join instead). True only for explicit
+     * pagination beyond a single row (`skip` or `take` other than 1). Implicit `take: 1` from
+     * `findUnique` stays false so `findUnique`+deep includes use the cheaper set-based join.
      */
     private parentRowsetBoundedForOrderedToManyCorrelation = false;
 

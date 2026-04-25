@@ -294,8 +294,16 @@ export abstract class BaseOperationHandler<Schema extends SchemaDef> {
         if (args) {
             const readArgs = args as FindArgs<Schema, GetModels<Schema>, any, true>;
             if (this.dialect instanceof LateralJoinDialectBase) {
+                const takeRaw = readArgs.take;
+                const skipRaw = readArgs.skip;
+                const takeN = takeRaw === undefined ? undefined : Number(takeRaw);
+                const skipN = skipRaw === undefined ? undefined : Number(skipRaw);
+                // Do not treat single-row reads (`take` 1 or unset) as "bounded" for correlated lateral:
+                // `findUnique` / `findFirst` inject `take: 1` as a number, but args may use numeric strings.
+                // For one parent row the global hash-aggregate plan is usually cheaper (tier3 on PGlite).
                 this.dialect.setParentRowsetBoundedForOrderedToManyCorrelation(
-                    readArgs.take !== undefined || readArgs.skip !== undefined,
+                    (skipN !== undefined && !Number.isNaN(skipN) && skipN > 0) ||
+                        (takeN !== undefined && !Number.isNaN(takeN) && takeN !== 1),
                 );
             }
             const shouldPrePaginateBeforeIncludes =
