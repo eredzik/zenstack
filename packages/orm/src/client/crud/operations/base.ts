@@ -293,6 +293,11 @@ export abstract class BaseOperationHandler<Schema extends SchemaDef> {
 
         if (args) {
             const readArgs = args as FindArgs<Schema, GetModels<Schema>, any, true>;
+            if (this.dialect instanceof LateralJoinDialectBase) {
+                this.dialect.setParentRowsetBoundedForOrderedToManyCorrelation(
+                    readArgs.take !== undefined || readArgs.skip !== undefined,
+                );
+            }
             const shouldPrePaginateBeforeIncludes =
                 this.dialect instanceof LateralJoinDialectBase &&
                 'include' in readArgs &&

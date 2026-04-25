@@ -24,6 +24,14 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
     private pendingReadCtes: { name: string; query: SelectQueryBuilder<any, any, any> }[] = [];
     private readCteNameCount = new Map<string, number>();
 
+    /**
+     * When false, skip PostgreSQL correlated `LEFT JOIN LATERAL` for ordered set-based to-many
+     * includes at the root — those re-run the lateral subquery per parent row and devastate
+     * large `findMany` (use one global hash-aggregate join instead). True after `take`/`skip`
+     * on the read (including implicit `take: 1` from findUnique).
+     */
+    private parentRowsetBoundedForOrderedToManyCorrelation = false;
+
     private get useCteNestedRelations() {
         return this.options.postgresNestedRelationDialect === 'cte';
     }
@@ -31,6 +39,12 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
     beginReadPlan() {
         this.pendingReadCtes = [];
         this.readCteNameCount.clear();
+        this.parentRowsetBoundedForOrderedToManyCorrelation = false;
+    }
+
+    /** Called from read() after beginReadPlan. */
+    setParentRowsetBoundedForOrderedToManyCorrelation(bounded: boolean) {
+        this.parentRowsetBoundedForOrderedToManyCorrelation = bounded;
     }
 
     applyReadPlan(kysely: any, query: SelectQueryBuilder<any, any, any>) {
@@ -271,7 +285,8 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
             applyParentJoinFilter &&
             this.provider === 'postgresql' &&
             !this.useCteNestedRelations &&
-            needsOrderedRelationSubquery;
+            needsOrderedRelationSubquery &&
+            this.parentRowsetBoundedForOrderedToManyCorrelation;
 
         let tbl: SelectQueryBuilder<any, any, any>;
         if (this.canJoinWithoutNestedSelect(relationModelDef, payload)) {
