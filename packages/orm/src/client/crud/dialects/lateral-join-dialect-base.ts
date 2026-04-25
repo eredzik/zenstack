@@ -8,6 +8,7 @@ import {
     ensureArray,
     getDelegateDescendantModels,
     getManyToManyRelation,
+    getRelationForeignKeyFieldPairs,
     isRelationField,
     requireField,
     requireIdFields,
@@ -33,6 +34,13 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
      */
     private parentRowsetBoundedForOrderedToManyCorrelation = false;
 
+    /**
+     * When the root read filters by a single-column primary key equality (e.g. `findUnique` where
+     * `{ id: 'u1' }`), push that value into PostgreSQL window-rewrite child scans so nested ordered
+     * to-many includes do not rank the entire child table before joining.
+     */
+    private pendingReadRootPkEquality: { model: string; value: unknown } | null = null;
+
     private get useCteNestedRelations() {
         return this.options.postgresNestedRelationDialect === 'cte';
     }
@@ -41,11 +49,17 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
         this.pendingReadCtes = [];
         this.readCteNameCount.clear();
         this.parentRowsetBoundedForOrderedToManyCorrelation = false;
+        this.pendingReadRootPkEquality = null;
     }
 
     /** Called from read() after beginReadPlan. */
     setParentRowsetBoundedForOrderedToManyCorrelation(bounded: boolean) {
         this.parentRowsetBoundedForOrderedToManyCorrelation = bounded;
+    }
+
+    /** Root `where` for the current read (used to narrow windowed child scans on PostgreSQL). */
+    setPendingReadRootWhereForChildScanPushdown(model: string, where: unknown) {
+        this.pendingReadRootPkEquality = this.tryExtractRootSinglePkEqualityFilter(model, where);
     }
 
     applyReadPlan(kysely: any, query: SelectQueryBuilder<any, any, any>) {
@@ -301,6 +315,8 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                     relationSelectName,
                     parentAlias,
                 );
+            } else {
+                tbl = this.applyPendingRootPkAsChildForeignKey(model, relationField, relationSelectName, tbl);
             }
         } else {
             let inner = this.buildModelSelect(relationModel, `${relationSelectName}$t`, payload, true);
@@ -315,6 +331,13 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                     relationModel,
                     `${relationSelectName}$t`,
                     parentAlias,
+                );
+            } else {
+                inner = this.applyPendingRootPkAsChildForeignKey(
+                    model,
+                    relationField,
+                    `${relationSelectName}$t`,
+                    inner,
                 );
             }
             tbl = this.eb.selectFrom(inner.as(relationSelectName));
@@ -497,6 +520,8 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
             baseQuery = baseQuery.select((eb) => eb.ref(`${relationModelAlias}.${field}`).as(alias));
         });
 
+        baseQuery = this.applyPendingRootPkAsChildForeignKey(model, relationField, relationModelAlias, baseQuery);
+
         const orderBySql = this.buildWindowOrderBySql(relationModel, relationModelAlias, payload);
         const partitionBySql = sql.join(
             relationJoinKeys.map(({ field }) => sql.ref(`${relationModelAlias}.${field}`)),
@@ -607,6 +632,66 @@ export abstract class LateralJoinDialectBase<Schema extends SchemaDef> extends B
                 return result;
             },
         );
+    }
+
+    private tryExtractRootSinglePkEqualityFilter(model: string, where: unknown): { model: string; value: unknown } | null {
+        if (!where || typeof where !== 'object' || Array.isArray(where)) {
+            return null;
+        }
+        const idFields = requireIdFields(this.schema, model);
+        if (idFields.length !== 1) {
+            return null;
+        }
+        const pk = idFields[0]!;
+        const raw = (where as Record<string, unknown>)[pk];
+        if (raw === undefined) {
+            return null;
+        }
+        let value: unknown;
+        if (raw !== null && typeof raw === 'object' && !Array.isArray(raw) && 'equals' in (raw as object)) {
+            value = (raw as { equals: unknown }).equals;
+        } else {
+            value = raw;
+        }
+        if (value === undefined) {
+            return null;
+        }
+        return { model, value };
+    }
+
+    /**
+     * When the root read is filtered to one parent row by PK and a nested to-many uses that FK
+     * on the child model, add `child.fk = pkValue` on the child scan / window input so PostgreSQL
+     * does not sort or window over unrelated rows (e.g. all posts when loading user u1's posts).
+     */
+    private applyPendingRootPkAsChildForeignKey(
+        parentModel: string,
+        relationField: string,
+        childModelAlias: string,
+        query: SelectQueryBuilder<any, any, any>,
+    ): SelectQueryBuilder<any, any, any> {
+        if (this.provider !== 'postgresql' || !this.pendingReadRootPkEquality) {
+            return query;
+        }
+        const { model: rootModel, value } = this.pendingReadRootPkEquality;
+        if (rootModel !== parentModel) {
+            return query;
+        }
+        const { keyPairs, ownedByModel } = getRelationForeignKeyFieldPairs(
+            this.schema,
+            parentModel,
+            relationField,
+        );
+        if (keyPairs.length !== 1) {
+            return query;
+        }
+        const parentPk = requireIdFields(this.schema, parentModel)[0]!;
+        const { fk, pk } = keyPairs[0]!;
+        // Standard to-many: the child owns the FK to the parent's PK (`Post.authorId` → `User.id`).
+        if (ownedByModel || pk !== parentPk) {
+            return query;
+        }
+        return query.where((eb) => eb(eb.ref(`${childModelAlias}.${fk}`), '=', value as any));
     }
 
     private canUseSetBasedToManyWindowing(

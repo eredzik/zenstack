@@ -294,6 +294,7 @@ export abstract class BaseOperationHandler<Schema extends SchemaDef> {
         if (args) {
             const readArgs = args as FindArgs<Schema, GetModels<Schema>, any, true>;
             if (this.dialect instanceof LateralJoinDialectBase) {
+                this.dialect.setPendingReadRootWhereForChildScanPushdown(model, readArgs.where);
                 const takeRaw = readArgs.take;
                 const skipRaw = readArgs.skip;
                 const takeN = takeRaw === undefined ? undefined : Number(takeRaw);
