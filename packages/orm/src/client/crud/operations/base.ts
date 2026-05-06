@@ -50,6 +50,7 @@ import {
     requireModel,
 } from '../../query-utils';
 import { getCrudDialect } from '../dialects';
+import { LateralJoinDialectBase } from '../dialects/lateral-join-dialect-base';
 import type { BaseCrudDialect } from '../dialects/base-dialect';
 import { InputValidator } from '../validator';
 
@@ -282,26 +283,72 @@ export abstract class BaseOperationHandler<Schema extends SchemaDef> {
         model: string,
         args: FindArgs<Schema, GetModels<Schema>, any, true> | undefined,
     ): Promise<any[]> {
+        if (this.dialect instanceof LateralJoinDialectBase) {
+            this.dialect.beginReadPlan();
+        }
+
         // table
         let query = this.dialect.buildSelectModel(model, model);
+        let outerArgs = args;
 
         if (args) {
-            query = this.dialect.buildFilterSortTake(model, args, query, model);
+            const readArgs = args as FindArgs<Schema, GetModels<Schema>, any, true>;
+            if (this.dialect instanceof LateralJoinDialectBase) {
+                this.dialect.setPendingReadRootWhereForChildScanPushdown(model, readArgs.where);
+                const takeRaw = readArgs.take;
+                const skipRaw = readArgs.skip;
+                const takeN = takeRaw === undefined ? undefined : Number(takeRaw);
+                const skipN = skipRaw === undefined ? undefined : Number(skipRaw);
+                // Do not treat single-row reads (`take` 1 or unset) as "bounded" for correlated lateral:
+                // `findUnique` / `findFirst` inject `take: 1` as a number, but args may use numeric strings.
+                // For one parent row the global hash-aggregate plan is usually cheaper (tier3 on PGlite).
+                this.dialect.setParentRowsetBoundedForOrderedToManyCorrelation(
+                    (skipN !== undefined && !Number.isNaN(skipN) && skipN > 0) ||
+                        (takeN !== undefined && !Number.isNaN(takeN) && takeN !== 1),
+                );
+            }
+            const shouldPrePaginateBeforeIncludes =
+                this.dialect instanceof LateralJoinDialectBase &&
+                'include' in readArgs &&
+                !!readArgs.include &&
+                (readArgs.take !== undefined || readArgs.skip !== undefined) &&
+                !!readArgs.orderBy;
+
+            if (shouldPrePaginateBeforeIncludes) {
+                // Force pagination to happen before nested relation joins so lateral/include work
+                // is only evaluated for the limited parent row set.
+                const paginatedBase = this.dialect.buildFilterSortTake(model, readArgs as any, query, model).selectAll(model);
+                query = kysely.selectFrom(() => paginatedBase.as(model)).selectAll();
+                outerArgs = {
+                    ...readArgs,
+                    orderBy: undefined,
+                    take: undefined,
+                    skip: undefined,
+                    cursor: undefined,
+                    distinct: undefined as any,
+                };
+            } else {
+                query = this.dialect.buildFilterSortTake(model, readArgs as any, query, model);
+            }
         }
 
         // select
-        if (args && 'select' in args && args.select) {
+        if (outerArgs && 'select' in outerArgs && outerArgs.select) {
             // select is mutually exclusive with omit
-            query = this.buildFieldSelection(model, query, args.select, model);
+            query = this.buildFieldSelection(model, query, outerArgs.select, model);
         } else {
             // include all scalar fields except those in omit
-            query = this.dialect.buildSelectAllFields(model, query, (args as any)?.omit, model);
+            query = this.dialect.buildSelectAllFields(model, query, (outerArgs as any)?.omit, model);
         }
 
         // include
-        if (args && 'include' in args && args.include) {
+        if (outerArgs && 'include' in outerArgs && outerArgs.include) {
             // note that 'omit' is handled above already
-            query = this.buildFieldSelection(model, query, args.include, model);
+            query = this.buildFieldSelection(model, query, outerArgs.include, model);
+        }
+
+        if (this.dialect instanceof LateralJoinDialectBase) {
+            query = this.dialect.applyReadPlan(kysely, query);
         }
 
         query = query.modifyEnd(this.makeContextComment({ model, operation: 'read' }));
