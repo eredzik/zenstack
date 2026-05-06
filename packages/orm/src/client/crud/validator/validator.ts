@@ -3,6 +3,7 @@ import { type GetModels, type ProcedureDef, type SchemaDef } from '@zenstackhq/s
 import { match } from 'ts-pattern';
 import { ZodType } from 'zod';
 import { formatError } from '../../../utils/zod-utils';
+import { performanceNow } from '../../executor/zenstack-driver';
 import type { ClientContract } from '../../contract';
 import {
     type AggregateArgs,
@@ -195,89 +196,98 @@ export class InputValidator<Schema extends SchemaDef> {
 
     // TODO: turn it into a Zod schema and cache
     validateProcedureInput(proc: string, input: unknown): unknown {
-        if (!this.enabled) {
-            return input;
-        }
-        const procDef = (this.client.$schema.procedures ?? {})[proc] as ProcedureDef | undefined;
-        invariant(procDef, `Procedure "${proc}" not found in schema`);
-
-        const params = Object.values(procDef.params ?? {});
-
-        // For procedures where every parameter is optional, allow omitting the input entirely.
-        if (typeof input === 'undefined') {
-            if (params.length === 0) {
-                return undefined;
-            }
-            if (params.every((p) => p.optional)) {
-                return undefined;
-            }
-            throw createInvalidInputError('Missing procedure arguments', `$procs.${proc}`);
-        }
-
-        if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-            throw createInvalidInputError('Procedure input must be an object', `$procs.${proc}`);
-        }
-
-        const envelope = input as Record<string, unknown>;
-        const argsPayload = Object.prototype.hasOwnProperty.call(envelope, 'args') ? (envelope as any).args : undefined;
-
-        if (params.length === 0) {
-            if (typeof argsPayload === 'undefined') {
+        const startedAt = performanceNow();
+        try {
+            if (!this.enabled) {
                 return input;
             }
+            const procDef = (this.client.$schema.procedures ?? {})[proc] as ProcedureDef | undefined;
+            invariant(procDef, `Procedure "${proc}" not found in schema`);
+
+            const params = Object.values(procDef.params ?? {});
+
+            // For procedures where every parameter is optional, allow omitting the input entirely.
+            if (typeof input === 'undefined') {
+                if (params.length === 0) {
+                    return undefined;
+                }
+                if (params.every((p) => p.optional)) {
+                    return undefined;
+                }
+                throw createInvalidInputError('Missing procedure arguments', `$procs.${proc}`);
+            }
+
+            if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+                throw createInvalidInputError('Procedure input must be an object', `$procs.${proc}`);
+            }
+
+            const envelope = input as Record<string, unknown>;
+            const argsPayload = Object.prototype.hasOwnProperty.call(envelope, 'args')
+                ? (envelope as any).args
+                : undefined;
+
+            if (params.length === 0) {
+                if (typeof argsPayload === 'undefined') {
+                    return input;
+                }
+                if (!argsPayload || typeof argsPayload !== 'object' || Array.isArray(argsPayload)) {
+                    throw createInvalidInputError('Procedure `args` must be an object', `$procs.${proc}`);
+                }
+                if (Object.keys(argsPayload as any).length === 0) {
+                    return input;
+                }
+                throw createInvalidInputError('Procedure does not accept arguments', `$procs.${proc}`);
+            }
+
+            if (typeof argsPayload === 'undefined') {
+                if (params.every((p) => p.optional)) {
+                    return input;
+                }
+                throw createInvalidInputError('Missing procedure arguments', `$procs.${proc}`);
+            }
+
             if (!argsPayload || typeof argsPayload !== 'object' || Array.isArray(argsPayload)) {
                 throw createInvalidInputError('Procedure `args` must be an object', `$procs.${proc}`);
             }
-            if (Object.keys(argsPayload as any).length === 0) {
-                return input;
-            }
-            throw createInvalidInputError('Procedure does not accept arguments', `$procs.${proc}`);
-        }
 
-        if (typeof argsPayload === 'undefined') {
-            if (params.every((p) => p.optional)) {
-                return input;
-            }
-            throw createInvalidInputError('Missing procedure arguments', `$procs.${proc}`);
-        }
+            const obj = argsPayload as Record<string, unknown>;
 
-        if (!argsPayload || typeof argsPayload !== 'object' || Array.isArray(argsPayload)) {
-            throw createInvalidInputError('Procedure `args` must be an object', `$procs.${proc}`);
-        }
+            for (const param of params) {
+                const value = (obj as any)[param.name];
 
-        const obj = argsPayload as Record<string, unknown>;
-
-        for (const param of params) {
-            const value = (obj as any)[param.name];
-
-            if (!Object.prototype.hasOwnProperty.call(obj, param.name)) {
-                if (param.optional) {
-                    continue;
+                if (!Object.prototype.hasOwnProperty.call(obj, param.name)) {
+                    if (param.optional) {
+                        continue;
+                    }
+                    throw createInvalidInputError(`Missing procedure argument: ${param.name}`, `$procs.${proc}`);
                 }
-                throw createInvalidInputError(`Missing procedure argument: ${param.name}`, `$procs.${proc}`);
-            }
 
-            if (typeof value === 'undefined') {
-                if (param.optional) {
-                    continue;
+                if (typeof value === 'undefined') {
+                    if (param.optional) {
+                        continue;
+                    }
+                    throw createInvalidInputError(
+                        `Invalid procedure argument: ${param.name} is required`,
+                        `$procs.${proc}`,
+                    );
                 }
-                throw createInvalidInputError(
-                    `Invalid procedure argument: ${param.name} is required`,
-                    `$procs.${proc}`,
-                );
+
+                const schema = this.zodFactory.makeProcedureParamSchema(param);
+                const parsed = schema.safeParse(value);
+                if (!parsed.success) {
+                    throw createInvalidInputError(
+                        `Invalid procedure argument: ${param.name}: ${formatError(parsed.error)}`,
+                        `$procs.${proc}`,
+                    );
+                }
             }
 
-            const schema = this.zodFactory.makeProcedureParamSchema(param);
-            const parsed = schema.safeParse(value);
-            if (!parsed.success) {
-                throw createInvalidInputError(
-                    `Invalid procedure argument: ${param.name}: ${formatError(parsed.error)}`,
-                    `$procs.${proc}`,
-                );
+            return input;
+        } finally {
+            if (this.enabled) {
+                (this.client as any).recordTiming?.('validationMs', performanceNow() - startedAt);
             }
         }
-
-        return input;
     }
 
     // #endregion
@@ -285,21 +295,28 @@ export class InputValidator<Schema extends SchemaDef> {
     // #region Validation helpers
 
     private validate<T>(model: GetModels<Schema>, operation: string, getSchema: GetSchemaFunc<Schema>, args: unknown) {
-        if (!this.enabled) {
-            return args as T;
+        const startedAt = performanceNow();
+        try {
+            if (!this.enabled) {
+                return args as T;
+            }
+            const schema = getSchema(model);
+            const { error, data } = schema.safeParse(args);
+            if (error) {
+                throw createInvalidInputError(
+                    `Invalid ${operation} args for model "${model}": ${formatError(error)}`,
+                    model,
+                    {
+                        cause: error,
+                    },
+                );
+            }
+            return data as T;
+        } finally {
+            if (this.enabled) {
+                (this.client as any).recordTiming?.('validationMs', performanceNow() - startedAt);
+            }
         }
-        const schema = getSchema(model);
-        const { error, data } = schema.safeParse(args);
-        if (error) {
-            throw createInvalidInputError(
-                `Invalid ${operation} args for model "${model}": ${formatError(error)}`,
-                model,
-                {
-                    cause: error,
-                },
-            );
-        }
-        return data as T;
     }
 
     // #endregion

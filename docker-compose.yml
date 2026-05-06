@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:latest
+    restart: always
+    # command:
+    #   - postgres
+    #   - -c
+    #   - fsync=off
+    #   - -c
+    #   - synchronous_commit=off
+    #   - -c
+    #   - full_page_writes=off
+    # tmpfs:
+    # - /var/lib/postgresql/data
+    ports:
+      - 5432:5432
+    expose:
+      - 5432
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres

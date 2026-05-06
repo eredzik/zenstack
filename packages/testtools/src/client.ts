@@ -187,6 +187,19 @@ export async function createTestClient(
         ...rest,
     } as ClientOptions<SchemaDef>;
 
+    if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'true') {
+        _options.setBasedNestedInclude = true;
+    }
+    if (process.env['TEST_SET_BASED_NESTED_INCLUDE'] === 'false') {
+        _options.setBasedNestedInclude = false;
+    }
+
+    if (process.env['TEST_PG_NESTED_RELATION_DIALECT']) {
+        (_options as any).postgresNestedRelationDialect = process.env['TEST_PG_NESTED_RELATION_DIALECT'] as
+            | 'lateral'
+            | 'cte';
+    }
+
     if (options?.debug) {
         console.log(`Work directory: ${workDir}`);
         console.log(`Database name: ${dbName}`);

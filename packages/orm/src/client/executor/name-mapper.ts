@@ -37,7 +37,6 @@ import {
     getEnum,
     getField,
     getManyToManyRelation,
-    getModel,
     getModelFields,
     isEnum,
     stripAlias,
@@ -53,17 +52,24 @@ type SelectionNodeChild = SimpleReferenceExpressionNode | AliasNode | SelectAllN
 
 export class QueryNameMapper extends OperationNodeTransformer {
     private readonly modelToTableMap = new Map<string, string>();
-    private readonly fieldToColumnMap = new Map<string, string>();
+    private readonly fieldToColumnMapByModel = new Map<string, Map<string, string>>();
     private readonly enumTypeMap = new Map<string, string>();
     // Maps implicit many-to-many join table names to their PostgreSQL schema
     private readonly joinTableSchemaMap = new Map<string, string>();
+    private readonly modelFieldNameSet = new Map<string, Set<string>>();
+    private readonly modelsWithMappedColumns = new Set<string>();
+    private readonly modelsUsingEnumWithMappedValues = new Set<string>();
+    private readonly resolvedFieldScopeCache = new Map<string, Scope | undefined>();
+
     private readonly scopes: Scope[] = [];
+    private scopeVersion = 0;
     private readonly dialect: BaseCrudDialect<SchemaDef>;
 
     constructor(private readonly client: ClientContract<SchemaDef>) {
         super();
         this.dialect = getCrudDialect(client.$schema, client.$options);
         for (const [modelName, modelDef] of Object.entries(client.$schema.models)) {
+            this.modelFieldNameSet.set(modelName, new Set(Object.keys(modelDef.fields)));
             const mappedName = this.getMappedName(modelDef);
             if (mappedName) {
                 this.modelToTableMap.set(modelName, mappedName);
@@ -72,7 +78,21 @@ export class QueryNameMapper extends OperationNodeTransformer {
             for (const fieldDef of getModelFields(this.schema, modelName)) {
                 const mappedName = this.getMappedName(fieldDef);
                 if (mappedName) {
-                    this.fieldToColumnMap.set(`${modelName}.${fieldDef.name}`, mappedName);
+                    let modelFieldMap = this.fieldToColumnMapByModel.get(modelName);
+                    if (!modelFieldMap) {
+                        modelFieldMap = new Map<string, string>();
+                        this.fieldToColumnMapByModel.set(modelName, modelFieldMap);
+                    }
+                    modelFieldMap.set(fieldDef.name, mappedName);
+                    this.modelsWithMappedColumns.add(modelName);
+                }
+
+                const enumDef = getEnum(this.schema, fieldDef.type);
+                if (
+                    enumDef &&
+                    Object.values(enumDef.fields ?? {}).some((f) => f.attributes?.some((attr) => attr.name === '@map'))
+                ) {
+                    this.modelsUsingEnumWithMappedValues.add(modelName);
                 }
             }
         }
@@ -107,6 +127,13 @@ export class QueryNameMapper extends OperationNodeTransformer {
     }
 
     // #region overrides
+
+    run<T extends OperationNode>(node: T): T {
+        this.scopes.length = 0;
+        this.scopeVersion = 0;
+        this.resolvedFieldScopeCache.clear();
+        return this.transformNode(node);
+    }
 
     protected override transformSelectQuery(node: SelectQueryNode, queryId?: QueryId) {
         if (!node.from?.froms) {
@@ -422,6 +449,12 @@ export class QueryNameMapper extends OperationNodeTransformer {
     }
 
     private resolveFieldFromScopes(name: string, qualifier?: string) {
+        const cacheKey = `${this.scopeVersion}|${qualifier ?? ''}|${name}`;
+        if (this.resolvedFieldScopeCache.has(cacheKey)) {
+            return this.resolvedFieldScopeCache.get(cacheKey);
+        }
+
+        let resolvedScope: Scope | undefined;
         for (let i = this.scopes.length - 1; i >= 0; i--) {
             const scope = this.scopes[i]!;
             if (qualifier) {
@@ -430,7 +463,8 @@ export class QueryNameMapper extends OperationNodeTransformer {
                 if (scope.alias) {
                     if (scope.alias && IdentifierNode.is(scope.alias) && scope.alias.name === qualifier) {
                         // scope has an alias that matches the qualifier
-                        return scope;
+                        resolvedScope = scope;
+                        break;
                     } else {
                         // scope has an alias but it doesn't match the qualifier
                         continue;
@@ -438,7 +472,8 @@ export class QueryNameMapper extends OperationNodeTransformer {
                 } else if (scope.model) {
                     if (scope.model === qualifier) {
                         // scope has a model that matches the qualifier
-                        return scope;
+                        resolvedScope = scope;
+                        break;
                     } else {
                         // scope has a model but it doesn't match the qualifier
                         continue;
@@ -447,21 +482,24 @@ export class QueryNameMapper extends OperationNodeTransformer {
             } else {
                 // if the field has no qualifier, match with model name
                 if (scope.model) {
-                    const modelDef = getModel(this.schema, scope.model);
-                    if (!modelDef) {
+                    const modelFields = this.modelFieldNameSet.get(scope.model);
+                    if (!modelFields) {
                         continue;
                     }
-                    if (getModelFields(this.schema, scope.model).some((f) => f.name === name)) {
-                        return scope;
+                    if (modelFields.has(name)) {
+                        resolvedScope = scope;
+                        break;
                     }
                 }
             }
         }
-        return undefined;
+        this.resolvedFieldScopeCache.set(cacheKey, resolvedScope);
+        return resolvedScope;
     }
 
     private pushScope(scope: Scope) {
         this.scopes.push(scope);
+        this.scopeVersion += 1;
     }
 
     private withScope<T>(scope: Scope, fn: (...args: unknown[]) => T): T {
@@ -470,6 +508,7 @@ export class QueryNameMapper extends OperationNodeTransformer {
             return fn();
         } finally {
             this.scopes.pop();
+            this.scopeVersion += 1;
         }
     }
 
@@ -479,6 +518,7 @@ export class QueryNameMapper extends OperationNodeTransformer {
             return fn();
         } finally {
             scopes.forEach(() => this.scopes.pop());
+            this.scopeVersion += 1;
         }
     }
 
@@ -510,7 +550,7 @@ export class QueryNameMapper extends OperationNodeTransformer {
     }
 
     private mapFieldName(model: string, field: string): string {
-        const mappedName = this.fieldToColumnMap.get(`${model}.${field}`);
+        const mappedName = this.fieldToColumnMapByModel.get(model)?.get(field);
         if (mappedName) {
             return mappedName;
         } else {
@@ -528,7 +568,7 @@ export class QueryNameMapper extends OperationNodeTransformer {
     }
 
     private hasMappedColumns(modelName: string) {
-        return [...this.fieldToColumnMap.keys()].some((key) => key.startsWith(modelName + '.'));
+        return this.modelsWithMappedColumns.has(modelName);
     }
 
     // convert a "from" node to a nested query if there are columns with name mapping
@@ -675,17 +715,7 @@ export class QueryNameMapper extends OperationNodeTransformer {
     // #region enum value mapping
 
     private modelUsesEnumWithMappedValues(model: string) {
-        const modelDef = getModel(this.schema, model);
-        if (!modelDef) {
-            return false;
-        }
-        return getModelFields(this.schema, model).some((fieldDef) => {
-            const enumDef = getEnum(this.schema, fieldDef.type);
-            if (!enumDef) {
-                return false;
-            }
-            return Object.values(enumDef.fields ?? {}).some((f) => f.attributes?.some((attr) => attr.name === '@map'));
-        });
+        return this.modelsUsingEnumWithMappedValues.has(model);
     }
 
     private getEnumValueMapping(enumDef: EnumDef) {

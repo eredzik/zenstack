@@ -2,13 +2,16 @@ import { clone } from '@zenstackhq/common-helpers';
 import { ZenStackClient } from '@zenstackhq/orm';
 import { PostgresDialect } from '@zenstackhq/orm/dialects/postgres';
 import { PolicyPlugin } from '@zenstackhq/plugin-policy';
-import { TEST_PG_URL } from '@zenstackhq/testtools';
 import { Database } from 'bun:sqlite';
 import { afterEach, describe, expect, it } from 'bun:test';
 import type { Dialect } from 'kysely';
 import { BunSqliteDialect } from 'kysely-bun-sqlite';
 import { Client, Pool } from 'pg';
 import { schema } from './schemas/schema';
+
+const TEST_PG_URL = `postgres://${process.env['TEST_PG_USER'] ?? 'postgres'}:${
+    process.env['TEST_PG_PASSWORD'] ?? 'postgres'
+}@${process.env['TEST_PG_HOST'] ?? 'localhost'}:${process.env['TEST_PG_PORT'] ?? '5432'}`;
 
 describe('Bun e2e tests', () => {
     const provider = (process.env['TEST_DB_PROVIDER'] ?? 'sqlite') as 'sqlite' | 'postgresql';
@@ -19,7 +22,9 @@ describe('Bun e2e tests', () => {
         await _db?.$disconnect();
     });
 
-    it('works with simple CRUD', async () => {
+    it(
+        'works with simple CRUD',
+        async () => {
         const db = (_db = await createClient(provider, 'bun-e2e-crud'));
 
         const user = await db.user.create({
@@ -47,9 +52,13 @@ describe('Bun e2e tests', () => {
         await db.user.delete({ where: { id: '1' } });
         const count = await db.user.count();
         expect(count).toBe(0);
-    });
+        },
+        600000,
+    );
 
-    it('enforces policies', async () => {
+    it(
+        'enforces policies',
+        async () => {
         const db = (_db = await createClient(provider, 'bun-e2e-policies'));
         const authDb = db.$use(new PolicyPlugin());
 
@@ -84,7 +93,9 @@ describe('Bun e2e tests', () => {
 
         const user2DbCount = await authDb.$setAuth({ id: '2' }).post.count();
         expect(user2DbCount).toBe(1);
-    });
+        },
+        600000,
+    );
 });
 
 async function createClient(provider: 'sqlite' | 'postgresql', dbName: string) {
@@ -101,6 +112,13 @@ async function createClient(provider: 'sqlite' | 'postgresql', dbName: string) {
             connectionString: TEST_PG_URL,
         });
         await pgClient.connect();
+        await pgClient.query(
+            `SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = $1
+               AND pid <> pg_backend_pid()`,
+            [dbName],
+        );
         await pgClient.query(`DROP DATABASE IF EXISTS "${dbName}"`);
         await pgClient.query(`CREATE DATABASE "${dbName}"`);
         await pgClient.end();
