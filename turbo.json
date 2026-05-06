@@ -19,5 +19,12 @@
             "cache": false
         }
     },
-    "globalPassThroughEnv": ["TEST_DB_PROVIDER"]
+    "globalPassThroughEnv": [
+        "TEST_DB_PROVIDER",
+        "TEST_SET_BASED_NESTED_INCLUDE",
+        "TEST_PG_HOST",
+        "TEST_PG_PORT",
+        "TEST_PG_USER",
+        "TEST_PG_PASSWORD"
+    ]
 }

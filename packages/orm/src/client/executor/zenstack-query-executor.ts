@@ -40,7 +40,8 @@ import type { AfterEntityMutationCallback, OnKyselyQueryCallback } from '../plug
 import { requireIdFields, stripAlias } from '../query-utils';
 import { QueryNameMapper } from './name-mapper';
 import { TempAliasTransformer } from './temp-alias-transformer';
-import type { ZenStackDriver } from './zenstack-driver';
+import { performanceNow, type ZenStackDriver } from './zenstack-driver';
+import type { QueryInfo } from '../diagnostics';
 
 type MutationQueryNode = InsertQueryNode | UpdateQueryNode | DeleteQueryNode;
 
@@ -50,12 +51,41 @@ type MutationInfo = {
     where: WhereNode | undefined;
 };
 
+type QueryTimingMetrics = {
+    queryTransformMs: number;
+    nameMappingMs: number;
+    tempAliasMs: number;
+    compileMs: number;
+    compileCacheKeyMs: number;
+    compileCacheLookupMs: number;
+    compileCacheStoreMs: number;
+    compileCacheHit: boolean;
+    dbExecuteMs: number;
+    pluginOnKyselyMs: number;
+    mutationHookMs: number;
+    transactionOverheadMs: number;
+    executorTotalMs: number;
+    executorUntrackedMs: number;
+    trackedSlowQueries: QueryInfo[];
+};
+
+type CompiledQueryCacheEntry = {
+    sql: string;
+    query: RootOperationNode;
+    parameters: readonly unknown[];
+};
+
+type TransformedQueryCacheEntry = {
+    query: RootOperationNode;
+};
+
 type CallBeforeMutationHooksArgs = {
     queryNode: OperationNode;
     mutationInfo: MutationInfo;
     loadBeforeMutationEntities: () => Promise<Record<string, unknown>[] | undefined>;
     client: ClientContract<SchemaDef>;
     queryId: QueryId;
+    timingMetrics: QueryTimingMetrics;
 };
 
 type CallAfterMutationHooksArgs = {
@@ -68,15 +98,21 @@ type CallAfterMutationHooksArgs = {
     queryId: QueryId;
     beforeMutationEntities?: Record<string, unknown>[];
     afterMutationEntities?: Record<string, unknown>[];
+    timingMetrics: QueryTimingMetrics;
 };
 
 const DEFAULT_MAX_SLOW_RECORDS = 100;
+const DEFAULT_COMPILED_QUERY_CACHE_MAX_ENTRIES = 500;
+const DEFAULT_TRANSFORMED_QUERY_CACHE_MAX_ENTRIES = 500;
 
 export class ZenStackQueryExecutor extends DefaultQueryExecutor {
     // #region constructor, fields and props
 
     private readonly nameMapper: QueryNameMapper | undefined;
     private readonly dialect: BaseCrudDialect<SchemaDef>;
+    private readonly tempAliasTransformer: TempAliasTransformer;
+    private readonly compiledQueryCache = new Map<string, CompiledQueryCacheEntry>();
+    private readonly transformedQueryCache = new Map<string, TransformedQueryCacheEntry>();
 
     constructor(
         private client: ClientImpl,
@@ -97,6 +133,9 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
         }
 
         this.dialect = getCrudDialect(client.$schema, client.$options);
+        this.tempAliasTransformer = new TempAliasTransformer({
+            mode: this.options.useCompactAliasNames === false ? 'compactLongNames' : 'alwaysCompact',
+        });
     }
 
     private schemaHasMappedNames(schema: SchemaDef) {
@@ -143,19 +182,42 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
         // - have plugins with Kysely hooks, as they may spawn more queries (check: should creating tx be plugin's responsibility?)
         // - have entity mutation plugins
         const needEnsureTx = this.hasOnKyselyHooks || this.hasEntityMutationPlugins;
+        const timingMetrics: QueryTimingMetrics = {
+            queryTransformMs: 0,
+            nameMappingMs: 0,
+            tempAliasMs: 0,
+            compileMs: 0,
+            compileCacheKeyMs: 0,
+            compileCacheLookupMs: 0,
+            compileCacheStoreMs: 0,
+            compileCacheHit: false,
+            dbExecuteMs: 0,
+            pluginOnKyselyMs: 0,
+            mutationHookMs: 0,
+            transactionOverheadMs: 0,
+            executorTotalMs: 0,
+            executorUntrackedMs: 0,
+            trackedSlowQueries: [],
+        };
 
+        const executeStart = performanceNow();
         const result = await this.provideConnection(async (connection) => {
             let startedTx = false;
             try {
+                let txOverheadStart = 0;
                 // mutations are wrapped in tx if not already in one
                 if (
                     this.isMutationNode(compiledQuery.query) &&
                     !this.driver.isTransactionConnection(connection) &&
                     needEnsureTx
                 ) {
+                    txOverheadStart = performanceNow();
                     await this.driver.beginTransaction(connection, {
                         isolationLevel: TransactionIsolationLevel.ReadCommitted,
                     });
+                    const txOverheadMs = performanceNow() - txOverheadStart;
+                    this.client.recordTiming('transactionOverheadMs', txOverheadMs);
+                    timingMetrics.transactionOverheadMs += txOverheadMs;
                     startedTx = true;
                 }
                 const result = await this.proceedQueryWithKyselyInterceptors(
@@ -163,14 +225,23 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
                     compiledQuery.query,
                     queryParams,
                     compiledQuery.queryId,
+                    timingMetrics,
                 );
                 if (startedTx) {
+                    txOverheadStart = performanceNow();
                     await this.driver.commitTransaction(connection);
+                    const txOverheadMs = performanceNow() - txOverheadStart;
+                    this.client.recordTiming('transactionOverheadMs', txOverheadMs);
+                    timingMetrics.transactionOverheadMs += txOverheadMs;
                 }
                 return result;
             } catch (err) {
                 if (startedTx) {
+                    const txOverheadStart = performanceNow();
                     await this.driver.rollbackTransaction(connection);
+                    const txOverheadMs = performanceNow() - txOverheadStart;
+                    this.client.recordTiming('transactionOverheadMs', txOverheadMs);
+                    timingMetrics.transactionOverheadMs += txOverheadMs;
                 }
                 if (err instanceof ORMError) {
                     throw err;
@@ -186,6 +257,22 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
             }
         });
 
+        timingMetrics.executorTotalMs = performanceNow() - executeStart;
+        const knownMs =
+            timingMetrics.queryTransformMs +
+            timingMetrics.compileMs +
+            timingMetrics.dbExecuteMs +
+            timingMetrics.pluginOnKyselyMs +
+            timingMetrics.mutationHookMs +
+            timingMetrics.transactionOverheadMs;
+        timingMetrics.executorUntrackedMs = Math.max(0, timingMetrics.executorTotalMs - knownMs);
+        this.client.recordTiming('executorUntrackedMs', timingMetrics.executorUntrackedMs);
+
+        for (const queryInfo of timingMetrics.trackedSlowQueries) {
+            queryInfo.executorTotalMs = timingMetrics.executorTotalMs;
+            queryInfo.executorUntrackedMs = timingMetrics.executorUntrackedMs;
+        }
+
         return this.ensureProperQueryResult(compiledQuery.query, result);
     }
 
@@ -194,8 +281,9 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
         queryNode: RootOperationNode,
         parameters: readonly unknown[] | undefined,
         queryId: QueryId,
+        timingMetrics: QueryTimingMetrics,
     ) {
-        let proceed = (q: RootOperationNode) => this.proceedQuery(connection, q, parameters, queryId);
+        let proceed = (q: RootOperationNode) => this.proceedQuery(connection, q, parameters, queryId, timingMetrics);
 
         const hooks: OnKyselyQueryCallback<SchemaDef>[] = [];
         // tsc perf
@@ -209,13 +297,27 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
             const _proceed = proceed;
             proceed = async (query: RootOperationNode) => {
                 const _p = (q: RootOperationNode) => _proceed(q);
-                const hookResult = await hook!({
-                    client: this.client as unknown as ClientContract<SchemaDef>,
-                    schema: this.client.$schema,
-                    query,
-                    proceed: _p,
-                });
-                return hookResult;
+                let proceedDuration = 0;
+                const hookStart = performanceNow();
+                try {
+                    return await hook!({
+                        client: this.client as unknown as ClientContract<SchemaDef>,
+                        schema: this.client.$schema,
+                        query,
+                        proceed: async (q: RootOperationNode) => {
+                            const proceedStart = performanceNow();
+                            try {
+                                return await _p(q);
+                            } finally {
+                                proceedDuration += performanceNow() - proceedStart;
+                            }
+                        },
+                    });
+                } finally {
+                    const pluginOnKyselyMs = Math.max(0, performanceNow() - hookStart - proceedDuration);
+                    this.client.recordTiming('pluginOnKyselyMs', pluginOnKyselyMs);
+                    timingMetrics.pluginOnKyselyMs += pluginOnKyselyMs;
+                }
             };
         }
 
@@ -229,10 +331,11 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
         query: RootOperationNode,
         parameters: readonly unknown[] | undefined,
         queryId: QueryId,
+        timingMetrics: QueryTimingMetrics,
     ) {
         if (this.suppressMutationHooks || !this.isMutationNode(query) || !this.hasEntityMutationPlugins) {
             // no need to handle mutation hooks, just proceed
-            return this.internalExecuteQuery(query, connection, queryId, parameters);
+            return this.internalExecuteQuery(query, connection, queryId, parameters, timingMetrics);
         }
 
         let preUpdateIds: Record<string, unknown>[] | undefined;
@@ -288,10 +391,11 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
             loadBeforeMutationEntities,
             client: connectionClient,
             queryId,
+            timingMetrics,
         });
 
         // execute the final query
-        const result = await this.internalExecuteQuery(query, connection, queryId, parameters);
+        const result = await this.internalExecuteQuery(query, connection, queryId, parameters, timingMetrics);
 
         let afterMutationEntities: Record<string, unknown>[] | undefined;
         if (needLoadAfterMutationEntities) {
@@ -314,6 +418,7 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
             queryId,
             beforeMutationEntities,
             afterMutationEntities,
+            timingMetrics,
         };
 
         if (!this.driver.isTransactionConnection(connection)) {
@@ -321,12 +426,14 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
             await this.callAfterMutationHooks({
                 ...baseArgs,
                 filterFor: 'all',
+                timingMetrics,
             });
         } else {
             // run after-mutation hooks that are requested to be run inside tx
             await this.callAfterMutationHooks({
                 ...baseArgs,
                 filterFor: 'inTx',
+                timingMetrics,
             });
 
             // register other after-mutation hooks to be run after the tx is committed
@@ -334,6 +441,7 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
                 this.callAfterMutationHooks({
                     ...baseArgs,
                     filterFor: 'outTx',
+                    timingMetrics,
                 }),
             );
         }
@@ -346,7 +454,7 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
     // #region before and after mutation hooks
 
     private async callBeforeMutationHooks(args: CallBeforeMutationHooksArgs) {
-        const { queryNode, mutationInfo, loadBeforeMutationEntities, client, queryId } = args;
+        const { queryNode, mutationInfo, loadBeforeMutationEntities, client, queryId, timingMetrics } = args;
 
         if (this.options.plugins) {
             for (const plugin of this.options.plugins) {
@@ -355,6 +463,7 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
                     continue;
                 }
 
+                const hookStart = performanceNow();
                 await onEntityMutation.beforeEntityMutation({
                     model: mutationInfo.model,
                     action: mutationInfo.action,
@@ -363,13 +472,24 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
                     client,
                     queryId,
                 });
+                const mutationHookMs = performanceNow() - hookStart;
+                this.client.recordTiming('mutationHookMs', mutationHookMs);
+                timingMetrics.mutationHookMs += mutationHookMs;
             }
         }
     }
 
     private async callAfterMutationHooks(args: CallAfterMutationHooksArgs) {
-        const { queryNode, mutationInfo, client, filterFor, queryId, beforeMutationEntities, afterMutationEntities } =
-            args;
+        const {
+            queryNode,
+            mutationInfo,
+            client,
+            filterFor,
+            queryId,
+            beforeMutationEntities,
+            afterMutationEntities,
+            timingMetrics,
+        } = args;
 
         const hooks: AfterEntityMutationCallback<SchemaDef>[] = [];
 
@@ -396,6 +516,7 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
         }
 
         for (const hook of hooks) {
+            const hookStart = performanceNow();
             await hook({
                 model: mutationInfo.model,
                 action: mutationInfo.action,
@@ -405,6 +526,9 @@ export class ZenStackQueryExecutor extends DefaultQueryExecutor {
                 client,
                 queryId,
             });
+            const mutationHookMs = performanceNow() - hookStart;
+            this.client.recordTiming('mutationHookMs', mutationHookMs);
+            timingMetrics.mutationHookMs += mutationHookMs;
         }
     }
 
@@ -636,21 +760,44 @@ In such cases, ZenStack cannot reliably determine the IDs of the mutated entitie
             }) as string;
     }
 
-    private processQueryNode<Node extends RootOperationNode>(query: Node): Node {
+    private processQueryNode<Node extends RootOperationNode>(query: Node, timingMetrics?: QueryTimingMetrics): Node {
+        const transformedCacheKey = this.createTransformedQueryCacheKey(query);
+        if (transformedCacheKey) {
+            const cachedTransformed = this.getTransformedQueryFromCache(transformedCacheKey);
+            if (cachedTransformed) {
+                return cachedTransformed.query as Node;
+            }
+        }
+
         let result = query;
+        const nameMappingStart = performanceNow();
         result = this.processNameMapping(result);
+        const nameMappingMs = performanceNow() - nameMappingStart;
+        this.client.recordTiming('nameMappingMs', nameMappingMs);
+        if (timingMetrics) {
+            timingMetrics.nameMappingMs += nameMappingMs;
+        }
+
+        const tempAliasStart = performanceNow();
         result = this.processTempAlias(result);
+        const tempAliasMs = performanceNow() - tempAliasStart;
+        this.client.recordTiming('tempAliasMs', tempAliasMs);
+        if (timingMetrics) {
+            timingMetrics.tempAliasMs += tempAliasMs;
+        }
+
+        if (transformedCacheKey) {
+            this.setTransformedQueryCache(transformedCacheKey, { query: result });
+        }
         return result;
     }
 
     private processNameMapping<Node extends RootOperationNode>(query: Node): Node {
-        return this.nameMapper?.transformNode(query) ?? query;
+        return this.nameMapper?.run(query) ?? query;
     }
 
     private processTempAlias<Node extends RootOperationNode>(query: Node): Node {
-        return new TempAliasTransformer({
-            mode: this.options.useCompactAliasNames === false ? 'compactLongNames' : 'alwaysCompact',
-        }).run(query);
+        return this.tempAliasTransformer.run(query);
     }
 
     private createClientForConnection(connection: DatabaseConnection, inTx: boolean) {
@@ -678,25 +825,109 @@ In such cases, ZenStack cannot reliably determine the IDs of the mutated entitie
         connection: DatabaseConnection,
         queryId?: QueryId,
         parameters?: readonly unknown[],
+        timingMetrics?: QueryTimingMetrics,
     ) {
         // run query node processors: name mapping, temp alias renaming, etc.
-        const finalQuery = this.processQueryNode(query);
+        const queryTransformStart = performanceNow();
+        const finalQuery = this.processQueryNode(query, timingMetrics);
+        const queryTransformMs = performanceNow() - queryTransformStart;
+        this.client.recordTiming('queryTransformMs', queryTransformMs);
+        if (timingMetrics) {
+            timingMetrics.queryTransformMs += queryTransformMs;
+        }
 
         // inherit the original queryId
-        let compiledQuery = this.compileQuery(finalQuery, queryId ?? createQueryId());
+        const compileStart = performanceNow();
+        let compiledQuery: CompiledQuery;
+        const effectiveQueryId = queryId ?? createQueryId();
+        const cacheKeyStart = performanceNow();
+        const cacheKey = this.createCompiledQueryCacheKey(finalQuery);
+        const compileCacheKeyMs = performanceNow() - cacheKeyStart;
+        this.client.recordTiming('compileCacheKeyMs', compileCacheKeyMs);
+        if (timingMetrics) {
+            timingMetrics.compileCacheKeyMs += compileCacheKeyMs;
+        }
+
+        const cacheLookupStart = performanceNow();
+        const cached = cacheKey ? this.getCompiledQueryFromCache(cacheKey) : undefined;
+        const compileCacheLookupMs = performanceNow() - cacheLookupStart;
+        this.client.recordTiming('compileCacheLookupMs', compileCacheLookupMs);
+        if (timingMetrics) {
+            timingMetrics.compileCacheLookupMs += compileCacheLookupMs;
+            timingMetrics.compileCacheHit = !!cached;
+        }
+        if (cached) {
+            compiledQuery = {
+                query: cached.query,
+                sql: cached.sql,
+                parameters: cached.parameters,
+                queryId: effectiveQueryId,
+            };
+        } else {
+            compiledQuery = this.compileQuery(finalQuery, effectiveQueryId);
+            if (cacheKey) {
+                const cacheStoreStart = performanceNow();
+                this.setCompiledQueryCache(cacheKey, {
+                    query: compiledQuery.query,
+                    sql: compiledQuery.sql,
+                    parameters: compiledQuery.parameters,
+                });
+                const compileCacheStoreMs = performanceNow() - cacheStoreStart;
+                this.client.recordTiming('compileCacheStoreMs', compileCacheStoreMs);
+                if (timingMetrics) {
+                    timingMetrics.compileCacheStoreMs += compileCacheStoreMs;
+                }
+            }
+        }
+        const compileMs = performanceNow() - compileStart;
+        this.client.recordTiming('compileMs', compileMs);
+        if (timingMetrics) {
+            timingMetrics.compileMs += compileMs;
+        }
         if (parameters) {
             compiledQuery = { ...compiledQuery, parameters: parameters };
         }
 
         const trackSlowQuery = this.options.diagnostics !== undefined;
-        const startTimestamp = trackSlowQuery ? performance.now() : undefined;
+        const startTimestamp = trackSlowQuery ? performanceNow() : undefined;
         const startedAt = trackSlowQuery ? new Date() : undefined;
 
         try {
+            const dbExecuteStart = performanceNow();
             const result = await connection.executeQuery<any>(compiledQuery);
+            const dbExecuteMs = performanceNow() - dbExecuteStart;
+            this.client.recordTiming('dbExecuteMs', dbExecuteMs);
+            if (timingMetrics) {
+                timingMetrics.dbExecuteMs += dbExecuteMs;
+            }
 
             if (startTimestamp !== undefined) {
-                this.trackSlowQuery(compiledQuery, startTimestamp, startedAt!);
+                this.trackSlowQuery(compiledQuery, startTimestamp, startedAt!, timingMetrics);
+                this.client.recordQueryTiming({
+                    startedAt: startedAt!,
+                    sql: compiledQuery.sql,
+                    totalMs:
+                        queryTransformMs +
+                        compileMs +
+                        dbExecuteMs +
+                        (timingMetrics?.pluginOnKyselyMs ?? 0) +
+                        (timingMetrics?.mutationHookMs ?? 0) +
+                        (timingMetrics?.transactionOverheadMs ?? 0),
+                    queryTransformMs: timingMetrics?.queryTransformMs ?? queryTransformMs,
+                    nameMappingMs: timingMetrics?.nameMappingMs ?? 0,
+                    tempAliasMs: timingMetrics?.tempAliasMs ?? 0,
+                    compileMs: timingMetrics?.compileMs ?? compileMs,
+                    compileCacheKeyMs: timingMetrics?.compileCacheKeyMs ?? 0,
+                    compileCacheLookupMs: timingMetrics?.compileCacheLookupMs ?? 0,
+                    compileCacheStoreMs: timingMetrics?.compileCacheStoreMs ?? 0,
+                    compileCacheHit: timingMetrics?.compileCacheHit ?? false,
+                    dbExecuteMs: timingMetrics?.dbExecuteMs ?? dbExecuteMs,
+                    pluginOnKyselyMs: timingMetrics?.pluginOnKyselyMs ?? 0,
+                    mutationHookMs: timingMetrics?.mutationHookMs ?? 0,
+                    transactionOverheadMs: timingMetrics?.transactionOverheadMs ?? 0,
+                    executorTotalMs: timingMetrics?.executorTotalMs ?? 0,
+                    executorUntrackedMs: timingMetrics?.executorUntrackedMs ?? 0,
+                });
             }
 
             return this.ensureProperQueryResult(compiledQuery.query, result);
@@ -710,8 +941,13 @@ In such cases, ZenStack cannot reliably determine the IDs of the mutated entitie
         }
     }
 
-    private trackSlowQuery(compiledQuery: CompiledQuery, startTimestamp: number, startedAt: Date) {
-        const durationMs = performance.now() - startTimestamp;
+    private trackSlowQuery(
+        compiledQuery: CompiledQuery,
+        startTimestamp: number,
+        startedAt: Date,
+        timingMetrics?: QueryTimingMetrics,
+    ) {
+        const durationMs = performanceNow() - startTimestamp;
         const thresholdMs = this.options.diagnostics?.slowQueryThresholdMs;
         if (thresholdMs === undefined || durationMs < thresholdMs) {
             return;
@@ -723,7 +959,26 @@ In such cases, ZenStack cannot reliably determine the IDs of the mutated entitie
             return;
         }
 
-        const queryInfo = { startedAt, durationMs, sql: compiledQuery.sql };
+        const queryInfo = {
+            startedAt,
+            durationMs,
+            sql: compiledQuery.sql,
+            queryTransformMs: timingMetrics?.queryTransformMs ?? 0,
+            nameMappingMs: timingMetrics?.nameMappingMs ?? 0,
+            tempAliasMs: timingMetrics?.tempAliasMs ?? 0,
+            compileMs: timingMetrics?.compileMs ?? 0,
+            compileCacheKeyMs: timingMetrics?.compileCacheKeyMs ?? 0,
+            compileCacheLookupMs: timingMetrics?.compileCacheLookupMs ?? 0,
+            compileCacheStoreMs: timingMetrics?.compileCacheStoreMs ?? 0,
+            compileCacheHit: timingMetrics?.compileCacheHit ?? false,
+            dbExecuteMs: timingMetrics?.dbExecuteMs ?? durationMs,
+            pluginOnKyselyMs: timingMetrics?.pluginOnKyselyMs ?? 0,
+            mutationHookMs: timingMetrics?.mutationHookMs ?? 0,
+            transactionOverheadMs: timingMetrics?.transactionOverheadMs ?? 0,
+            executorTotalMs: timingMetrics?.executorTotalMs ?? 0,
+            executorUntrackedMs: timingMetrics?.executorUntrackedMs ?? 0,
+        };
+        timingMetrics?.trackedSlowQueries.push(queryInfo);
 
         if (slowQueries.length >= maxRecords) {
             // find and remove the entry with the lowest duration
@@ -739,6 +994,100 @@ In such cases, ZenStack cannot reliably determine the IDs of the mutated entitie
             }
         } else {
             slowQueries.push(queryInfo);
+        }
+    }
+
+    private createCompiledQueryCacheKey(query: RootOperationNode): string | undefined {
+        if (this.getCompiledQueryCacheMaxEntries() <= 0) {
+            return undefined;
+        }
+        try {
+            return JSON.stringify(query, (_key, value: unknown) =>
+                typeof value === 'bigint' ? { __zenstackBigInt: value.toString() } : value,
+            );
+        } catch {
+            return undefined;
+        }
+    }
+
+    private getCompiledQueryCacheMaxEntries(): number {
+        return this.options.diagnostics?.compiledQueryCacheMaxEntries ?? DEFAULT_COMPILED_QUERY_CACHE_MAX_ENTRIES;
+    }
+
+    private createTransformedQueryCacheKey(query: RootOperationNode): string | undefined {
+        if (this.getTransformedQueryCacheMaxEntries() <= 0) {
+            return undefined;
+        }
+        try {
+            return JSON.stringify(query, (_key, value: unknown) =>
+                typeof value === 'bigint' ? { __zenstackBigInt: value.toString() } : value,
+            );
+        } catch {
+            return undefined;
+        }
+    }
+
+    private getTransformedQueryCacheMaxEntries(): number {
+        return (
+            this.options.diagnostics?.transformedQueryCacheMaxEntries ?? DEFAULT_TRANSFORMED_QUERY_CACHE_MAX_ENTRIES
+        );
+    }
+
+    private getTransformedQueryFromCache(key: string): TransformedQueryCacheEntry | undefined {
+        const entry = this.transformedQueryCache.get(key);
+        if (!entry) {
+            return undefined;
+        }
+        // LRU touch
+        this.transformedQueryCache.delete(key);
+        this.transformedQueryCache.set(key, entry);
+        return entry;
+    }
+
+    private setTransformedQueryCache(key: string, entry: TransformedQueryCacheEntry) {
+        const maxEntries = this.getTransformedQueryCacheMaxEntries();
+        if (maxEntries <= 0) {
+            return;
+        }
+        if (this.transformedQueryCache.has(key)) {
+            this.transformedQueryCache.delete(key);
+        }
+        this.transformedQueryCache.set(key, entry);
+        while (this.transformedQueryCache.size > maxEntries) {
+            const oldestKey = this.transformedQueryCache.keys().next().value as string | undefined;
+            if (!oldestKey) {
+                break;
+            }
+            this.transformedQueryCache.delete(oldestKey);
+        }
+    }
+
+    private getCompiledQueryFromCache(key: string): CompiledQueryCacheEntry | undefined {
+        const entry = this.compiledQueryCache.get(key);
+        if (!entry) {
+            return undefined;
+        }
+        // LRU touch
+        this.compiledQueryCache.delete(key);
+        this.compiledQueryCache.set(key, entry);
+        return entry;
+    }
+
+    private setCompiledQueryCache(key: string, entry: CompiledQueryCacheEntry) {
+        const maxEntries = this.getCompiledQueryCacheMaxEntries();
+        if (maxEntries <= 0) {
+            return;
+        }
+        if (this.compiledQueryCache.has(key)) {
+            this.compiledQueryCache.delete(key);
+        }
+        this.compiledQueryCache.set(key, entry);
+        while (this.compiledQueryCache.size > maxEntries) {
+            const oldestKey = this.compiledQueryCache.keys().next().value as string | undefined;
+            if (!oldestKey) {
+                break;
+            }
+            this.compiledQueryCache.delete(oldestKey);
         }
     }
 

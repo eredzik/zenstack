@@ -217,6 +217,25 @@ export type ClientOptions<Schema extends SchemaDef> = QueryOptions<Schema> & {
     skipValidationForComputedFields?: boolean;
 
     /**
+     * Enables set-based SQL generation for nested includes with ordering/pagination when supported by the
+     * selected dialect and query shape. Defaults to `false`.
+     *
+     * When enabled, ORM may choose a CTE/window-function based plan instead of correlated lateral subqueries
+     * for certain findMany + nested include queries to reduce repeated per-parent work.
+     */
+    setBasedNestedInclude?: boolean;
+
+    /**
+     * Strategy for PostgreSQL nested-relation SQL generation.
+     *
+     * - `lateral` (default): correlated lateral joins / derived tables.
+     * - `cte`: CTE-based relation planning dialect.
+     *
+     * This option is only honored when datasource provider is PostgreSQL.
+     */
+    postgresNestedRelationDialect?: 'lateral' | 'cte';
+
+    /**
      * Diagnostics related options.
      */
     diagnostics?: {
@@ -230,6 +249,24 @@ export type ClientOptions<Schema extends SchemaDef> = QueryOptions<Schema> & {
          * entry with the lowest duration will be removed. Set to `Infinity` to keep unlimited records.
          */
         slowQueryMaxRecords?: number;
+
+        /**
+         * Maximum number of per-query timing records to keep in memory. Defaults to `100`. Set to `Infinity` to keep
+         * unlimited records.
+         */
+        timingMaxRecords?: number;
+
+        /**
+         * Maximum number of compiled query entries to keep in the LRU cache. Defaults to `500`.
+         * Set to `0` to disable compiled query caching.
+         */
+        compiledQueryCacheMaxEntries?: number;
+
+        /**
+         * Maximum number of transformed query nodes to keep in the LRU cache. Defaults to `500`.
+         * Set to `0` to disable transformed query caching.
+         */
+        transformedQueryCacheMaxEntries?: number;
     };
 } & (HasComputedFields<Schema> extends true
         ? {
